@@ -480,6 +480,7 @@ enum class AllocationStrategyType {
     FREE_RATIO_FIRST,      // Free-ratio-first allocation
     CXL,                   // CXL-specific allocation
     SSD_FREE_RATIO_FIRST,  // SSD free-ratio-first allocation
+    CAPACITY_AWARE_P2C,    // Capacity-aware power-of-two-choices allocation
 };
 
 /**
