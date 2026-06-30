@@ -25,7 +25,8 @@ static constexpr size_t MiB = 1024 * 1024;
 
 // Strategy types for parameterized tests
 const auto kStrategyTypes = ::testing::Values(
-    AllocationStrategyType::RANDOM, AllocationStrategyType::FREE_RATIO_FIRST);
+    AllocationStrategyType::RANDOM, AllocationStrategyType::FREE_RATIO_FIRST,
+    AllocationStrategyType::CAPACITY_AWARE_P2C);
 
 const auto kAllocatorTypes = ::testing::Values(BufferAllocatorType::CACHELIB,
                                                BufferAllocatorType::OFFSET);
@@ -91,6 +92,9 @@ INSTANTIATE_TEST_SUITE_P(
                 break;
             case AllocationStrategyType::SSD_FREE_RATIO_FIRST:
                 strategy_str = "SsdFreeRatioFirst";
+                break;
+            case AllocationStrategyType::CAPACITY_AWARE_P2C:
+                strategy_str = "CapacityAwareP2C";
                 break;
             default:
                 strategy_str = "Unknown";
@@ -560,12 +564,15 @@ TEST_P(AllocationStrategyParameterizedTest,
 }
 
 // Test the performance of AllocationStrategy.
-// Test FreeRatioFirst load balancing distribution with different sized segments
+// Test FreeRatioFirst/CapacityAwareP2C load balancing distribution with
+// different sized segments. Both strategies should equalize utilization
+// ratios; this test asserts that property holds for either.
 TEST_P(AllocationStrategyParameterizedTest,
        FreeRatioFirstLoadBalancingDistribution) {
     auto [strategy_type, allocator_type] = GetParam();
-    if (strategy_type != AllocationStrategyType::FREE_RATIO_FIRST) {
-        // This test is only for FreeRatioFirst strategy
+    if (strategy_type != AllocationStrategyType::FREE_RATIO_FIRST &&
+        strategy_type != AllocationStrategyType::CAPACITY_AWARE_P2C) {
+        // This test is only for balancing strategies
         GTEST_SKIP();
     }
 
@@ -647,6 +654,97 @@ TEST_P(AllocationStrategyParameterizedTest,
     // Verify that utilization ratios are balanced (within 15%)
     EXPECT_LT(util_diff, 15.0)
         << "FreeRatioFirst should balance utilization ratios";
+}
+
+// Test that CapacityAwareP2C, on the heterogeneous topology
+// (8 small + 2 large @ 2.5x capacity), routes capacity-proportional
+// inflow and bounds the late-mount-style ramp-up share onto large
+// segments.
+TEST_F(AllocationStrategyTest, CapacityAwareP2CHeterogeneousSegmentBalance) {
+    constexpr size_t kSmallCount = 8;
+    constexpr size_t kLargeCount = 2;
+    constexpr size_t kSmallCap = 8 * MiB;
+    constexpr size_t kLargeCap = 20 * MiB;
+    constexpr size_t kSliceLen = 4096;
+
+    AllocatorManager allocator_manager;
+    size_t off = 0;
+    auto add = [&](const std::string& name, size_t cap) {
+        allocator_manager.addAllocator(
+            name,
+            std::make_shared<OffsetBufferAllocator>(
+                name, 0x100000000ULL + off, cap, name));
+        off += cap;
+    };
+    for (size_t i = 0; i < kSmallCount; ++i) {
+        add("small_" + std::to_string(i), kSmallCap);
+    }
+    for (size_t i = 0; i < kLargeCount; ++i) {
+        add("large_" + std::to_string(i), kLargeCap);
+    }
+
+    auto strategy = std::make_unique<CapacityAwareP2CAllocationStrategy>();
+
+    // Anti-storm guard: in the first ramp-up window (when large segments
+    // are empty and small are also empty, ratios tie → bytes tiebreak
+    // routes to large), the two large segments must not absorb more than
+    // ~2/N of writes. With N=10, 2/N = 20%; allow generous headroom to
+    // account for sampling variance.
+    constexpr size_t kRampAllocations = 200;
+    size_t large_hits_rampup = 0;
+    std::vector<std::vector<Replica>> all_replicas;
+    for (size_t i = 0; i < kRampAllocations; ++i) {
+        auto r = strategy->Allocate(allocator_manager, kSliceLen);
+        ASSERT_TRUE(r.has_value());
+        ASSERT_EQ(r.value().size(), 1u);
+        auto desc = r.value()[0].get_descriptor();
+        ASSERT_TRUE(desc.is_memory_replica());
+        const auto& name =
+            desc.get_memory_descriptor().buffer_descriptor.transport_endpoint_;
+        if (name.rfind("large_", 0) == 0) ++large_hits_rampup;
+        all_replicas.push_back(std::move(r.value()));
+    }
+    const double rampup_large_share =
+        static_cast<double>(large_hits_rampup) / kRampAllocations;
+    EXPECT_LT(rampup_large_share, 0.55)
+        << "CapacityAwareP2C should not storm large segments during ramp-up "
+           "(observed " << (rampup_large_share * 100) << "%)";
+
+    // Run more allocations to approach steady state. Total target is well
+    // under cluster capacity to avoid hitting allocator fragmentation.
+    const size_t kTotalCapacity =
+        kSmallCount * kSmallCap + kLargeCount * kLargeCap;
+    const size_t kTargetBytes = kTotalCapacity * 70 / 100;
+    const size_t kTotalAllocations = kTargetBytes / kSliceLen;
+    for (size_t i = kRampAllocations; i < kTotalAllocations; ++i) {
+        auto r = strategy->Allocate(allocator_manager, kSliceLen);
+        ASSERT_TRUE(r.has_value());
+        all_replicas.push_back(std::move(r.value()));
+    }
+
+    // Steady-state check: per-segment utilization ratios should be close.
+    auto utilization_of = [&](const std::string& name, size_t cap) {
+        auto* allocators = allocator_manager.getAllocators(name);
+        EXPECT_NE(allocators, nullptr);
+        size_t used = 0;
+        for (const auto& a : *allocators) used += a->size();
+        return static_cast<double>(used) / static_cast<double>(cap);
+    };
+
+    double min_util = 1.0, max_util = 0.0;
+    for (size_t i = 0; i < kSmallCount; ++i) {
+        double u = utilization_of("small_" + std::to_string(i), kSmallCap);
+        min_util = std::min(min_util, u);
+        max_util = std::max(max_util, u);
+    }
+    for (size_t i = 0; i < kLargeCount; ++i) {
+        double u = utilization_of("large_" + std::to_string(i), kLargeCap);
+        min_util = std::min(min_util, u);
+        max_util = std::max(max_util, u);
+    }
+    EXPECT_LT(max_util - min_util, 0.15)
+        << "CapacityAwareP2C should keep per-segment utilization within 15 pp "
+           "(min=" << min_util << " max=" << max_util << ")";
 }
 
 // Test the performance comparison between strategies
